@@ -81,20 +81,16 @@ class CcTarget(Target):
         self._check_incorrect_no_warning()
 
     def _check_deprecated_deps(self):
-        """check that whether it depends upon a deprecated library. """
-        for dep in self.deps:
-            target = self.target_database.get(dep, {})
-            if target.data.get('deprecated'):
-                replaced_targets = target.deps
-                replaced_target = ''
-                if replaced_targets:
-                    replaced_target = replaced_targets[0]
-                console.warning('//%s:%s : '
-                                '//%s:%s has been deprecated, '
-                                'please depends on //%s:%s' % (
-                                    self.path, self.name,
-                                    target.path, target.name,
-                                    replaced_target[0], replaced_target[1]))
+        """Check whether it depends upon a deprecated library. """
+        for key in self.deps:
+            dep = self.target_database.get(key)
+            if dep and dep.data.get('deprecated'):
+                replaced_deps = dep.deps
+                if replaced_deps:
+                    console.warning('%s: //%s has been deprecated, '
+                                    'please depends on //%s:%s' % (
+                                    self.fullname, dep.fullname,
+                                    replaced_deps[0][0], replaced_deps[0][1]))
 
     def _prepare_to_generate_rule(self):
         """Should be overridden. """
@@ -170,41 +166,37 @@ class CcTarget(Target):
         """
         return 'objs_%s' % self._generate_variable_name(self.path, self.name)
 
-    def _prebuilt_cc_library_target_path(self, prefer_dynamic=False):
-        """Returns the target path of the prebuilt cc library to be copied to.
-           when both .so and .a exist, return .so, if prefer_dynamic is True,
-           else return the exist one
+    def _prebuilt_cc_library_path(self, prefer_dynamic=False):
         """
-        src_path = self._prebuilt_cc_library_src_path(prefer_dynamic)
-        return os.path.join(self.build_path, self.path, os.path.basename(src_path))
 
-    def _prebuilt_cc_library_src_path(self, prefer_dynamic=False):
-        """Returns the source path of the prebuilt cc library.
-           when both .so and .a exist, return .so, if prefer_dynamic is True,
-           else return the exist one
+        Return source and target path of the prebuilt cc library.
+        When both .so and .a exist, return .so if prefer_dynamic is True.
+        Otherwise return the existing one.
+
         """
-        a_src_path = self._prebuilt_cc_library_make_src_filename(dynamic=False)
-        so_src_path = self._prebuilt_cc_library_make_src_filename(dynamic=True)
+        a_src_path = self._prebuilt_cc_library_pathname(dynamic=False)
+        so_src_path = self._prebuilt_cc_library_pathname(dynamic=True)
         libs = (a_src_path, so_src_path) # Ordered by priority
         if prefer_dynamic:
             libs = (so_src_path, a_src_path)
-        src = ''
+        source = ''
         for lib in libs:
             if os.path.exists(lib):
-                src = lib
+                source = lib
                 break
-        if not src:
-            console.error_exit('%s: Can not find ethier %s or %s' % (
+        if not source:
+            console.error_exit('%s: Can not find either %s or %s' % (
                                self.fullname, libs[0], libs[1]))
-        return src
+        target = self._target_file_path(os.path.basename(source))
+        return source, target
 
-    def _prebuilt_cc_library_make_src_filename(self, dynamic=False):
+    def _prebuilt_cc_library_pathname(self, dynamic=False):
         options = self.blade.get_options()
         suffix = 'a'
         if dynamic:
             suffix = 'so'
         return os.path.join(self.path, 'lib%s_%s' % (options.m, options.profile),
-                             'lib%s.%s' % (self.name, suffix))
+                            'lib%s.%s' % (self.name, suffix))
 
     def _prebuilt_cc_library_dynamic_soname(self, so):
         """Get the soname of prebuilt shared library. """
@@ -237,11 +229,6 @@ class CcTarget(Target):
 
     def _setup_link_flags(self):
         """linkflags. """
-        cc_config = configparse.blade_config.get_config('cc_config')
-        linkflags = cc_config['linkflags']
-        if linkflags:
-            self._write_rule('%s.Append(LINKFLAGS=%s)' % (self._env_name(), linkflags))
-
         extra_linkflags = self.data.get('extra_linkflags')
         if extra_linkflags:
             self._write_rule('%s.Append(LINKFLAGS=%s)' % (self._env_name(), extra_linkflags))
@@ -414,8 +401,17 @@ class CcTarget(Target):
                 return True
         return False
 
+    def _prebuilt_cc_library_rules(self, var_name, target, source):
+        """Generate scons rules for prebuilt cc library. """
+        if source.endswith('.a'):
+            self._write_rule('%s = top_env.File("%s")' % (var_name, source))
+        else:
+            self._write_rule('%s = top_env.Command("%s", "%s", '
+                             'Copy("$TARGET", "$SOURCE"))' % (
+                             var_name, target, source))
+
     def _prebuilt_cc_library(self):
-        """prebuilt cc library rules. """
+        """Prebuilt cc library rules. """
         # We allow a prebuilt cc_library doesn't exist if it is not used.
         # So if this library is not depended by any target, don't generate any
         # rule to avoid runtime error and also avoid unnecessary runtime cost.
@@ -423,26 +419,21 @@ class CcTarget(Target):
             return
 
         # Paths for static linking, may be a dynamic library!
-        static_src_path = self._prebuilt_cc_library_src_path()
-        static_target_path = self._prebuilt_cc_library_target_path()
+        static_src_path, static_target_path = self._prebuilt_cc_library_path()
         var_name = self._var_name()
-        self._write_rule('%s = top_env.Command("%s", "%s", '
-                         'Copy("$TARGET", "$SOURCE"))' % (
-                         var_name, static_target_path, static_src_path))
+        self._prebuilt_cc_library_rules(var_name, static_target_path, static_src_path)
         self.data['static_cc_library_var'] = var_name
 
         dynamic_src_path, dynamic_target_path = '', ''
         if self._need_dynamic_library():
-            dynamic_target_path = self._prebuilt_cc_library_target_path(
-                    prefer_dynamic=True)
-            dynamic_src_path = self._prebuilt_cc_library_src_path(
+            dynamic_src_path, dynamic_target_path = self._prebuilt_cc_library_path(
                     prefer_dynamic=True)
             # Avoid copy twice if has only one kind of library
             if dynamic_target_path != static_target_path:
                 var_name = self._var_name('dynamic')
-                self._write_rule('%s = top_env.Command("%s", "%s", '
-                                 'Copy("$TARGET", "$SOURCE"))' % (
-                                 var_name, dynamic_target_path, dynamic_src_path))
+                self._prebuilt_cc_library_rules(var_name,
+                                                dynamic_target_path,
+                                                dynamic_src_path)
             self.data['dynamic_cc_library_var'] = var_name
 
         # Make a symbol link if either lib is a so
@@ -551,7 +542,6 @@ class CcTarget(Target):
         env_name = self._env_name()
 
         self._setup_cc_flags()
-        self._setup_as_flags()
 
         objs = []
         for src in self.srcs:
@@ -642,9 +632,9 @@ class CcLibrary(CcTarget):
         self.data['secure'] = secure
 
     def _rpath_link(self, dynamic):
-        lib_path = self._prebuilt_cc_library_target_path(dynamic)
-        if lib_path.endswith('.so'):
-            return os.path.dirname(lib_path)
+        path = self._prebuilt_cc_library_path(dynamic)[1]
+        if path.endswith('.so'):
+            return os.path.dirname(path)
         return None
 
     def scons_rules(self):
@@ -653,11 +643,11 @@ class CcLibrary(CcTarget):
         It outputs the scons rules according to user options.
 
         """
-        self._prepare_to_generate_rule()
-
         if self.type == 'prebuilt_cc_library':
+            self._check_deprecated_deps()
             self._prebuilt_cc_library()
         elif self.srcs:
+            self._prepare_to_generate_rule()
             self._cc_objects_rules()
             self._cc_library()
 
